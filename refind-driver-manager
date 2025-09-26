@@ -1,0 +1,379 @@
+#!/bin/bash
+
+# =============================================================================
+# refind-driver-manager — Manage rEFInd EFI drivers
+# Companion script to live-refind-install for selective driver installation
+# =============================================================================
+
+set -euo pipefail
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Available drivers mapping (common names to actual filenames)
+declare -A DRIVER_MAP=(
+    ["ext4"]="ext4_x64.efi"
+    ["ext2"]="ext2_x64.efi"
+    ["btrfs"]="btrfs_x64.efi"
+    ["xfs"]="xfs_x64.efi"
+    ["jfs"]="jfs_x64.efi"
+    ["reiserfs"]="reiserfs_x64.efi"
+    ["ntfs"]="ntfs_x64.efi"
+    ["fat"]="fat_x64.efi"
+    ["hfs"]="hfs_x64.efi"
+    ["hfsplus"]="hfsplus_x64.efi"
+    ["iso9660"]="iso9660_x64.efi"
+    ["udf"]="udf_x64.efi"
+    ["apfs"]="apfs_x64.efi"
+    ["zfs"]="zfs_x64.efi"
+)
+
+# Detect if running in chroot or live environment
+if [[ "$(stat -c %d:%i /)" == "$(stat -c %d:%i /proc/1/root/.)" ]]; then
+    ESP_MNT="/mnt/boot"
+    echo -e "${BLUE}Detected: Running from live environment${NC}"
+else
+    ESP_MNT="/boot"
+    echo -e "${BLUE}Detected: Running from chroot environment${NC}"
+fi
+
+REFIND_DIR="$ESP_MNT/EFI/refind"
+DRIVERS_DIR="$REFIND_DIR/drivers_x64"
+SOURCE_DRIVERS="/usr/share/refind/refind/drivers_x64"
+
+# Functions
+show_usage() {
+    cat << EOF
+${GREEN}rEFInd Driver Manager${NC}
+
+${YELLOW}USAGE:${NC}
+    $0 [OPTIONS] [COMMAND] [DRIVERS...]
+
+${YELLOW}COMMANDS:${NC}
+    install DRIVERS...    Install specified drivers
+    remove DRIVERS...     Remove specified drivers
+    list                  List all available drivers
+    list-installed        List currently installed drivers
+    auto                  Auto-detect and install drivers for current filesystems
+
+${YELLOW}OPTIONS:${NC}
+    -h, --help           Show this help message
+    -v, --verbose        Verbose output
+    --dry-run           Show what would be done without doing it
+
+${YELLOW}AVAILABLE DRIVERS:${NC}
+    ext4, ext2, btrfs, xfs, jfs, reiserfs    Linux filesystems
+    ntfs, fat                                Windows filesystems
+    hfs, hfsplus, apfs                       macOS filesystems
+    iso9660, udf                             Optical media
+    zfs                                      ZFS filesystem
+
+${YELLOW}EXAMPLES:${NC}
+    $0 install btrfs ntfs iso9660      # Install specific drivers
+    $0 remove ntfs                     # Remove NTFS driver
+    $0 auto                            # Auto-detect needed drivers
+    $0 list                            # Show all available drivers
+    $0 --dry-run install ext4 btrfs    # Preview what would be installed
+
+EOF
+}
+
+list_available_drivers() {
+    echo -e "${GREEN}Available rEFInd drivers:${NC}"
+    echo
+    printf "%-12s %-20s %s\n" "NAME" "FILENAME" "DESCRIPTION"
+    printf "%-12s %-20s %s\n" "----" "--------" "-----------"
+    printf "%-12s %-20s %s\n" "ext4" "ext4_x64.efi" "Linux ext2/3/4 filesystems"
+    printf "%-12s %-20s %s\n" "ext2" "ext2_x64.efi" "Linux ext2 filesystem (legacy)"
+    printf "%-12s %-20s %s\n" "btrfs" "btrfs_x64.efi" "Linux Btrfs filesystem"
+    printf "%-12s %-20s %s\n" "xfs" "xfs_x64.efi" "Linux XFS filesystem"
+    printf "%-12s %-20s %s\n" "jfs" "jfs_x64.efi" "IBM JFS filesystem"
+    printf "%-12s %-20s %s\n" "reiserfs" "reiserfs_x64.efi" "ReiserFS filesystem"
+    printf "%-12s %-20s %s\n" "ntfs" "ntfs_x64.efi" "Windows NTFS filesystem"
+    printf "%-12s %-20s %s\n" "fat" "fat_x64.efi" "FAT12/16/32 filesystem"
+    printf "%-12s %-20s %s\n" "hfs" "hfs_x64.efi" "macOS HFS filesystem"
+    printf "%-12s %-20s %s\n" "hfsplus" "hfsplus_x64.efi" "macOS HFS+ filesystem"
+    printf "%-12s %-20s %s\n" "apfs" "apfs_x64.efi" "macOS APFS filesystem"
+    printf "%-12s %-20s %s\n" "iso9660" "iso9660_x64.efi" "CD/DVD ISO 9660 filesystem"
+    printf "%-12s %-20s %s\n" "udf" "udf_x64.efi" "Universal Disk Format"
+    printf "%-12s %-20s %s\n" "zfs" "zfs_x64.efi" "ZFS filesystem"
+}
+
+list_installed_drivers() {
+    echo -e "${GREEN}Currently installed rEFInd drivers:${NC}"
+    echo
+    
+    if [[ ! -d "$DRIVERS_DIR" ]]; then
+        echo -e "${YELLOW}No drivers directory found at $DRIVERS_DIR${NC}"
+        return 1
+    fi
+    
+    if [[ -z "$(ls -A "$DRIVERS_DIR" 2>/dev/null)" ]]; then
+        echo -e "${YELLOW}No drivers currently installed${NC}"
+        return 0
+    fi
+    
+    for driver_file in "$DRIVERS_DIR"/*.efi; do
+        if [[ -f "$driver_file" ]]; then
+            driver_name=$(basename "$driver_file")
+            # Find the friendly name
+            for name in "${!DRIVER_MAP[@]}"; do
+                if [[ "${DRIVER_MAP[$name]}" == "$driver_name" ]]; then
+                    echo -e "${GREEN}✓${NC} $name ($driver_name)"
+                    break
+                fi
+            done
+        fi
+    done
+}
+
+auto_detect_drivers() {
+    echo -e "${BLUE}Auto-detecting required filesystem drivers...${NC}"
+    
+    local detected_drivers=()
+    
+    # Check mounted filesystems
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+([^[:space:]]+) ]]; then
+            fstype="${BASH_REMATCH[1]}"
+            case "$fstype" in
+                ext2|ext3|ext4) 
+                    if [[ ! " ${detected_drivers[*]} " =~ " ext4 " ]]; then
+                        detected_drivers+=("ext4")
+                    fi
+                    ;;
+                btrfs)
+                    if [[ ! " ${detected_drivers[*]} " =~ " btrfs " ]]; then
+                        detected_drivers+=("btrfs")
+                    fi
+                    ;;
+                xfs)
+                    if [[ ! " ${detected_drivers[*]} " =~ " xfs " ]]; then
+                        detected_drivers+=("xfs")
+                    fi
+                    ;;
+                ntfs)
+                    if [[ ! " ${detected_drivers[*]} " =~ " ntfs " ]]; then
+                        detected_drivers+=("ntfs")
+                    fi
+                    ;;
+                vfat)
+                    if [[ ! " ${detected_drivers[*]} " =~ " fat " ]]; then
+                        detected_drivers+=("fat")
+                    fi
+                    ;;
+            esac
+        fi
+    done < <(findmnt -n -o SOURCE,TARGET,FSTYPE)
+    
+    # Always suggest iso9660 for optical media support
+    detected_drivers+=("iso9660")
+    
+    if [[ ${#detected_drivers[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No additional drivers detected as needed${NC}"
+        return 0
+    fi
+    
+    echo -e "${GREEN}Detected filesystems requiring drivers:${NC}"
+    printf '%s\n' "${detected_drivers[@]}" | sort -u
+    echo
+    
+    echo -e "${YELLOW}Install these drivers? (y/N):${NC}"
+    read -r response
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        install_drivers "${detected_drivers[@]}"
+    else
+        echo "Auto-detection cancelled."
+    fi
+}
+
+install_drivers() {
+    local drivers=("$@")
+    
+    if [[ ${#drivers[@]} -eq 0 ]]; then
+        echo -e "${RED}Error: No drivers specified${NC}"
+        return 1
+    fi
+    
+    # Check if rEFInd is installed
+    if [[ ! -d "$REFIND_DIR" ]]; then
+        echo -e "${RED}Error: rEFInd not found at $REFIND_DIR${NC}"
+        echo "Please run live-refind-install first."
+        return 1
+    fi
+    
+    # Create drivers directory if it doesn't exist
+    mkdir -p "$DRIVERS_DIR"
+    
+    # Check if source drivers exist
+    if [[ ! -d "$SOURCE_DRIVERS" ]]; then
+        echo -e "${RED}Error: rEFInd package not installed or drivers not found at $SOURCE_DRIVERS${NC}"
+        return 1
+    fi
+    
+    local installed_count=0
+    local failed_drivers=()
+    
+    for driver in "${drivers[@]}"; do
+        if [[ -z "${DRIVER_MAP[$driver]:-}" ]]; then
+            echo -e "${YELLOW}Warning: Unknown driver '$driver' - skipping${NC}"
+            failed_drivers+=("$driver")
+            continue
+        fi
+        
+        local driver_file="${DRIVER_MAP[$driver]}"
+        local source_path="$SOURCE_DRIVERS/$driver_file"
+        local dest_path="$DRIVERS_DIR/$driver_file"
+        
+        if [[ ! -f "$source_path" ]]; then
+            echo -e "${YELLOW}Warning: Driver file $driver_file not found in rEFInd package${NC}"
+            failed_drivers+=("$driver")
+            continue
+        fi
+        
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo -e "${BLUE}[DRY RUN]${NC} Would install: $driver ($driver_file)"
+        else
+            if cp "$source_path" "$dest_path"; then
+                echo -e "${GREEN}✓${NC} Installed: $driver ($driver_file)"
+                ((installed_count++))
+            else
+                echo -e "${RED}✗${NC} Failed to install: $driver ($driver_file)"
+                failed_drivers+=("$driver")
+            fi
+        fi
+    done
+    
+    if [[ "$DRY_RUN" != "true" ]]; then
+        echo
+        echo -e "${GREEN}Successfully installed $installed_count driver(s)${NC}"
+        
+        if [[ ${#failed_drivers[@]} -gt 0 ]]; then
+            echo -e "${YELLOW}Failed drivers: ${failed_drivers[*]}${NC}"
+        fi
+    fi
+}
+
+remove_drivers() {
+    local drivers=("$@")
+    
+    if [[ ${#drivers[@]} -eq 0 ]]; then
+        echo -e "${RED}Error: No drivers specified${NC}"
+        return 1
+    fi
+    
+    if [[ ! -d "$DRIVERS_DIR" ]]; then
+        echo -e "${YELLOW}No drivers directory found${NC}"
+        return 0
+    fi
+    
+    local removed_count=0
+    local failed_drivers=()
+    
+    for driver in "${drivers[@]}"; do
+        if [[ -z "${DRIVER_MAP[$driver]:-}" ]]; then
+            echo -e "${YELLOW}Warning: Unknown driver '$driver' - skipping${NC}"
+            failed_drivers+=("$driver")
+            continue
+        fi
+        
+        local driver_file="${DRIVER_MAP[$driver]}"
+        local driver_path="$DRIVERS_DIR/$driver_file"
+        
+        if [[ ! -f "$driver_path" ]]; then
+            echo -e "${YELLOW}Warning: Driver $driver ($driver_file) not installed${NC}"
+            failed_drivers+=("$driver")
+            continue
+        fi
+        
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo -e "${BLUE}[DRY RUN]${NC} Would remove: $driver ($driver_file)"
+        else
+            if rm "$driver_path"; then
+                echo -e "${GREEN}✓${NC} Removed: $driver ($driver_file)"
+                ((removed_count++))
+            else
+                echo -e "${RED}✗${NC} Failed to remove: $driver ($driver_file)"
+                failed_drivers+=("$driver")
+            fi
+        fi
+    done
+    
+    if [[ "$DRY_RUN" != "true" ]]; then
+        echo
+        echo -e "${GREEN}Successfully removed $removed_count driver(s)${NC}"
+        
+        if [[ ${#failed_drivers[@]} -gt 0 ]]; then
+            echo -e "${YELLOW}Failed drivers: ${failed_drivers[*]}${NC}"
+        fi
+    fi
+}
+
+# Parse command line arguments
+VERBOSE=false
+DRY_RUN=false
+COMMAND=""
+DRIVERS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        install|remove|list|list-installed|auto)
+            COMMAND="$1"
+            shift
+            break
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown option '$1'${NC}"
+            echo "Use --help for usage information."
+            exit 1
+            ;;
+    esac
+done
+
+# Collect remaining arguments as drivers
+DRIVERS=("$@")
+
+# Execute command
+case "$COMMAND" in
+    install)
+        install_drivers "${DRIVERS[@]}"
+        ;;
+    remove)
+        remove_drivers "${DRIVERS[@]}"
+        ;;
+    list)
+        list_available_drivers
+        ;;
+    list-installed)
+        list_installed_drivers
+        ;;
+    auto)
+        auto_detect_drivers
+        ;;
+    "")
+        echo -e "${RED}Error: No command specified${NC}"
+        echo "Use --help for usage information."
+        exit 1
+        ;;
+    *)
+        echo -e "${RED}Error: Unknown command '$COMMAND'${NC}"
+        echo "Use --help for usage information."
+        exit 1
+        ;;
+esac

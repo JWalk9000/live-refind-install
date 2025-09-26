@@ -8,6 +8,77 @@
 
 set -euo pipefail  # Exit on errors, undefined vars, pipe failures
 
+# Parse command line arguments
+DRIVERS=()
+VERBOSE=false
+
+show_usage() {
+    cat << EOF
+rEFInd Installation Script
+
+USAGE:
+    $0 [OPTIONS]
+
+OPTIONS:
+    --drivers DRIVER...    Install specific filesystem drivers (btrfs, ext4, ntfs, etc.)
+    --verbose             Enable verbose output
+    -h, --help           Show this help message
+
+EXAMPLES:
+    $0                              # Install rEFInd with no additional drivers
+    $0 --drivers btrfs ntfs         # Install with Btrfs and NTFS drivers
+    $0 --drivers ext4 iso9660       # Install with ext4 and ISO9660 drivers
+
+AVAILABLE DRIVERS:
+    ext4, ext2, btrfs, xfs, jfs, reiserfs, ntfs, fat, hfs, hfsplus, apfs, iso9660, udf, zfs
+
+Note: The script will auto-detect LVM and Btrfs subvolumes when relevant drivers are specified.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --drivers)
+            shift
+            while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+                DRIVERS+=("$1")
+                shift
+            done
+            ;;
+        --verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown option '$1'"
+            echo "Use --help for usage information."
+            exit 1
+            ;;
+    esac
+done
+
+# Driver mapping
+declare -A DRIVER_MAP=(
+    ["ext4"]="ext4_x64.efi"
+    ["ext2"]="ext2_x64.efi" 
+    ["btrfs"]="btrfs_x64.efi"
+    ["xfs"]="xfs_x64.efi"
+    ["jfs"]="jfs_x64.efi"
+    ["reiserfs"]="reiserfs_x64.efi"
+    ["ntfs"]="ntfs_x64.efi"
+    ["fat"]="fat_x64.efi"
+    ["hfs"]="hfs_x64.efi"
+    ["hfsplus"]="hfsplus_x64.efi"
+    ["iso9660"]="iso9660_x64.efi"
+    ["udf"]="udf_x64.efi"
+    ["apfs"]="apfs_x64.efi"
+    ["zfs"]="zfs_x64.efi"
+)
+
 # Detect if running in chroot or live environment
 if [[ "$(stat -c %d:%i /)" == "$(stat -c %d:%i /proc/1/root/.)" ]]; then
     # Running in live environment
@@ -89,9 +160,90 @@ if [ -z "$ROOT_FSTYPE" ]; then
     exit 1
 fi
 
+# Enhanced detection for LVM and Btrfs subvolumes
+ROOT_EXTRA_PARAMS=""
+BTRFS_SUBVOL=""
+LVM_DETECTED=false
+
+# Check if root device is on LVM
+if [[ "$ROOT_DEVICE" =~ ^/dev/mapper/ ]]; then
+    LVM_DETECTED=true
+    echo "LVM detected: $ROOT_DEVICE"
+fi
+
+# Enhanced Btrfs detection
+if [[ "$ROOT_FSTYPE" == "btrfs" ]]; then
+    echo "Btrfs filesystem detected - performing enhanced analysis..."
+    
+    # Get Btrfs subvolume info
+    BTRFS_SUBVOL=$(findmnt -n -o OPTIONS "$ROOT_MOUNT_POINT" | grep -o 'subvol=[^,]*' | cut -d= -f2 || echo "")
+    if [[ -n "$BTRFS_SUBVOL" && "$BTRFS_SUBVOL" != "/" ]]; then
+        echo "Btrfs subvolume: $BTRFS_SUBVOL"
+        ROOT_EXTRA_PARAMS="rootflags=subvol=$BTRFS_SUBVOL"
+    fi
+    
+    # Detect Btrfs compression
+    BTRFS_COMPRESS=$(findmnt -n -o OPTIONS "$ROOT_MOUNT_POINT" | grep -o 'compress=[^,]*' | cut -d= -f2 || echo "")
+    if [[ -n "$BTRFS_COMPRESS" ]]; then
+        echo "Btrfs compression: $BTRFS_COMPRESS"
+        if [[ -n "$ROOT_EXTRA_PARAMS" ]]; then
+            ROOT_EXTRA_PARAMS="$ROOT_EXTRA_PARAMS,compress=$BTRFS_COMPRESS"
+        else
+            ROOT_EXTRA_PARAMS="rootflags=compress=$BTRFS_COMPRESS"
+        fi
+    fi
+    
+    # Detect multi-device Btrfs
+    if command -v btrfs >/dev/null 2>&1; then
+        BTRFS_DEVICES=$(btrfs filesystem show "$ROOT_DEVICE" 2>/dev/null | grep -c "devid" || echo "1")
+        if [[ "$BTRFS_DEVICES" -gt 1 ]]; then
+            echo "Btrfs multi-device setup detected ($BTRFS_DEVICES devices)"
+            
+            # Get RAID level
+            BTRFS_RAID=$(btrfs filesystem usage "$ROOT_MOUNT_POINT" 2>/dev/null | grep "Data ratio" | awk '{print $3}' || echo "unknown")
+            if [[ "$BTRFS_RAID" != "unknown" && "$BTRFS_RAID" != "1.00" ]]; then
+                echo "Btrfs RAID level: $BTRFS_RAID"
+            fi
+        fi
+    else
+        echo "Note: 'btrfs' command not available - limited Btrfs detection"
+    fi
+    
+    # Check for Btrfs snapshots (potential boot options)
+    if command -v btrfs >/dev/null 2>&1 && [[ -n "$TARGET_MNT" || "$ROOT_MOUNT_POINT" == "/" ]]; then
+        SNAPSHOT_PATH="$ROOT_MOUNT_POINT"
+        if [[ -n "$TARGET_MNT" ]]; then
+            SNAPSHOT_PATH="$TARGET_MNT"
+        fi
+        
+        # Look for common snapshot locations
+        SNAPSHOTS_FOUND=false
+        for snap_dir in ".snapshots" "snapshots" "@snapshots"; do
+            if [[ -d "$SNAPSHOT_PATH/$snap_dir" ]]; then
+                SNAPSHOT_COUNT=$(find "$SNAPSHOT_PATH/$snap_dir" -maxdepth 2 -name "snapshot" -type d 2>/dev/null | wc -l)
+                if [[ "$SNAPSHOT_COUNT" -gt 0 ]]; then
+                    echo "Btrfs snapshots found: $SNAPSHOT_COUNT in $snap_dir/"
+                    SNAPSHOTS_FOUND=true
+                    break
+                fi
+            fi
+        done
+        
+        if [[ "$SNAPSHOTS_FOUND" == false ]]; then
+            echo "No Btrfs snapshots detected"
+        fi
+    fi
+fi
+
 echo "Root device: $ROOT_DEVICE"
-echo "Root UUID:   $ROOT_UUID"
+echo "Root UUID:   $ROOT_UUID" 
 echo "Filesystem:  $ROOT_FSTYPE"
+if [[ "$LVM_DETECTED" == true ]]; then
+    echo "LVM:         Detected"
+fi
+if [[ -n "$BTRFS_SUBVOL" ]]; then
+    echo "Btrfs subvol: $BTRFS_SUBVOL"
+fi
 
 # -----------------------------------------------------------------------------
 # 4. Detect installed kernels in /boot
@@ -148,11 +300,64 @@ case "$ARCH" in
     *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-# Copy rEFInd binaries (icons, drivers, etc.)
-cp -r /usr/share/refind/refind/* "$REFIND_DIR/" || {
-    echo "Failed to copy rEFInd files"
+# Copy essential rEFInd files (excluding drivers - use refind-driver-manager for those)
+cp "/usr/share/refind/refind/$EFI_BINARY" "$REFIND_DIR/" || {
+    echo "Failed to copy rEFInd EFI binary"
     exit 1
 }
+
+# Copy icons directory
+if [[ -d "/usr/share/refind/refind/icons" ]]; then
+    cp -r /usr/share/refind/refind/icons "$REFIND_DIR/" || {
+        echo "Warning: Failed to copy icons directory"
+    }
+fi
+
+# Copy fonts directory if it exists
+if [[ -d "/usr/share/refind/refind/fonts" ]]; then
+    cp -r /usr/share/refind/refind/fonts "$REFIND_DIR/" || {
+        echo "Warning: Failed to copy fonts directory"
+    }
+fi
+
+# Copy tools directory if it exists
+if [[ -d "/usr/share/refind/refind/tools_x64" ]]; then
+    cp -r /usr/share/refind/refind/tools_x64 "$REFIND_DIR/" || {
+        echo "Warning: Failed to copy tools directory"
+    }
+fi
+
+# Create drivers directory
+mkdir -p "$REFIND_DIR/drivers_x64"
+
+# Install requested drivers
+if [[ ${#DRIVERS[@]} -gt 0 ]]; then
+    echo "Installing requested filesystem drivers..."
+    
+    for driver in "${DRIVERS[@]}"; do
+        if [[ -z "${DRIVER_MAP[$driver]:-}" ]]; then
+            echo "Warning: Unknown driver '$driver' - skipping"
+            continue
+        fi
+        
+        driver_file="${DRIVER_MAP[$driver]}"
+        source_path="/usr/share/refind/refind/drivers_x64/$driver_file"
+        dest_path="$REFIND_DIR/drivers_x64/$driver_file"
+        
+        if [[ ! -f "$source_path" ]]; then
+            echo "Warning: Driver file $driver_file not found in rEFInd package"
+            continue
+        fi
+        
+        if cp "$source_path" "$dest_path"; then
+            echo "✓ Installed driver: $driver ($driver_file)"
+        else
+            echo "✗ Failed to install driver: $driver ($driver_file)"
+        fi
+    done
+else
+    echo "ℹ️  No drivers specified. Use 'refind-driver-manager' to install filesystem drivers later."
+fi
 
 # -----------------------------------------------------------------------------
 # 6. Generate refind_linux.conf
@@ -176,16 +381,28 @@ for entry in "${KERNEL_ENTRIES[@]}"; do
         KERNEL_DISPLAY_NAME="Arch Linux ($KERNEL_NAME)"
     fi
 
+    # Build kernel parameters
+    KERNEL_PARAMS="root=UUID=$ROOT_UUID rw rootfstype=$ROOT_FSTYPE"
+    
+    # Add Btrfs subvolume parameter if needed
+    if [[ -n "$ROOT_EXTRA_PARAMS" ]]; then
+        KERNEL_PARAMS="$KERNEL_PARAMS $ROOT_EXTRA_PARAMS"
+    fi
+    
+    # Add quiet and EFI memmap
+    KERNEL_PARAMS="$KERNEL_PARAMS quiet add_efi_memmap"
+
     # Main boot line
-    echo "\"Boot $KERNEL_NAME\" \"root=UUID=$ROOT_UUID rw rootfstype=$ROOT_FSTYPE quiet add_efi_memmap initrd=/$INITRAMFS\"" >> "$REFIND_DIR/refind_linux.conf"
+    echo "\"Boot $KERNEL_NAME\" \"$KERNEL_PARAMS initrd=/$INITRAMFS\"" >> "$REFIND_DIR/refind_linux.conf"
 
     # Fallback initramfs entry (if exists)
     if [[ -f "$BOOT_DIR/$FALLBACK" ]]; then
-        echo "\"Boot $KERNEL_NAME (fallback initramfs)\" \"root=UUID=$ROOT_UUID rw rootfstype=$ROOT_FSTYPE quiet add_efi_memmap initrd=/$FALLBACK\"" >> "$REFIND_DIR/refind_linux.conf"
+        echo "\"Boot $KERNEL_NAME (fallback initramfs)\" \"$KERNEL_PARAMS initrd=/$FALLBACK\"" >> "$REFIND_DIR/refind_linux.conf"
     fi
 
-    # Single-user mode
-    echo "\"Boot $KERNEL_NAME (single-user)\" \"root=UUID=$ROOT_UUID rw rootfstype=$ROOT_FSTYPE add_efi_memmap initrd=/$INITRAMFS single\"" >> "$REFIND_DIR/refind_linux.conf"
+    # Single-user mode (remove quiet for debugging)
+    SINGLE_USER_PARAMS=$(echo "$KERNEL_PARAMS" | sed 's/quiet //')
+    echo "\"Boot $KERNEL_NAME (single-user)\" \"$SINGLE_USER_PARAMS single initrd=/$INITRAMFS\"" >> "$REFIND_DIR/refind_linux.conf"
 done
 
 # Add a separator and recovery note
@@ -201,6 +418,61 @@ cat >> "$REFIND_DIR/refind_linux.conf" <<EOF
 EOF
 
 echo "✅ refind_linux.conf generated with ${#KERNEL_ENTRIES[@]} kernel(s)"
+
+# Generate Btrfs snapshot boot entries if applicable
+if [[ "$ROOT_FSTYPE" == "btrfs" && "$SNAPSHOTS_FOUND" == true && ${#KERNEL_ENTRIES[@]} -gt 0 ]]; then
+    echo "Generating Btrfs snapshot boot entries..."
+    
+    # Add separator for snapshot entries
+    cat >> "$REFIND_DIR/refind_linux.conf" <<EOF
+
+# =============================================================================
+# Btrfs Snapshot Boot Entries
+# =============================================================================
+EOF
+    
+    # Find recent snapshots (limit to 3 most recent for menu simplicity)
+    if [[ -n "$TARGET_MNT" ]]; then
+        SNAP_BASE="$TARGET_MNT"
+    else
+        SNAP_BASE="/"
+    fi
+    
+    # Get the first kernel for snapshot entries (usually the main kernel)
+    first_entry="${KERNEL_ENTRIES[0]}"
+    IFS='|' read -r SNAP_KERNEL_NAME SNAP_INITRAMFS SNAP_FALLBACK <<< "$first_entry"
+    
+    # Look for snapshots in common locations
+    for snap_dir in ".snapshots" "snapshots" "@snapshots"; do
+        if [[ -d "$SNAP_BASE/$snap_dir" ]]; then
+            # Find recent snapshots (numbered directories with snapshot subdirs)
+            while IFS= read -r -d '' snapshot_path; do
+                SNAPSHOT_NUM=$(basename "$(dirname "$snapshot_path")")
+                SNAPSHOT_SUBVOL=$(basename "$snapshot_path")
+                
+                # Generate snapshot boot entry
+                if [[ -n "$BTRFS_SUBVOL" ]]; then
+                    SNAPSHOT_ROOTFLAGS="rootflags=subvol=$snap_dir/$SNAPSHOT_NUM/$SNAPSHOT_SUBVOL"
+                else
+                    SNAPSHOT_ROOTFLAGS="rootflags=subvol=$snap_dir/$SNAPSHOT_NUM/$SNAPSHOT_SUBVOL"
+                fi
+                
+                # Add compression if detected
+                if [[ -n "$BTRFS_COMPRESS" ]]; then
+                    SNAPSHOT_ROOTFLAGS="$SNAPSHOT_ROOTFLAGS,compress=$BTRFS_COMPRESS"
+                fi
+                
+                # Create snapshot boot entry
+                echo "\"Boot $SNAP_KERNEL_NAME (snapshot $SNAPSHOT_NUM)\" \"root=UUID=$ROOT_UUID rw rootfstype=$ROOT_FSTYPE $SNAPSHOT_ROOTFLAGS quiet add_efi_memmap initrd=/$SNAP_INITRAMFS\"" >> "$REFIND_DIR/refind_linux.conf"
+                
+            done < <(find "$SNAP_BASE/$snap_dir" -maxdepth 2 -name "snapshot" -type d -print0 2>/dev/null | head -z -3)
+            
+            break # Only process the first snapshot directory found
+        fi
+    done
+    
+    echo "✅ Btrfs snapshot boot entries added"
+fi
 
 # -----------------------------------------------------------------------------
 # 7. Register rEFInd with EFI boot manager
@@ -270,7 +542,31 @@ else
 fi
 echo ""
 echo "💡 TIPS:"
+if [[ ${#DRIVERS[@]} -eq 0 ]]; then
+    echo "   • Install drivers next time: $0 --drivers btrfs ntfs iso9660"
+    echo "   • Or use: ./refind-driver-manager install btrfs ntfs"
+fi
+echo "   • Manage drivers later: ./refind-driver-manager [install|remove|list] [drivers...]"
 echo "   • If you use LUKS: Add 'cryptdevice=UUID=...:cryptroot' to kernel parameters"
-echo "   • If you use ZFS: Add 'zfs=zroot/ROOT/default' (or your pool/dataset)"
+echo "   • If you use ZFS: Add 'zfs=zroot/ROOT/default' (or your pool/dataset)" 
 echo "   • Edit $REFIND_DIR/refind_linux.conf to customize boot parameters"
+if [[ "$LVM_DETECTED" == true ]]; then
+    echo "   • LVM detected - ensure 'lvm2' hook is in /etc/mkinitcpio.conf"
+fi
+if [[ "$ROOT_FSTYPE" == "btrfs" ]]; then
+    echo "   • Btrfs filesystem detected with enhanced support:"
+    if [[ -n "$BTRFS_SUBVOL" ]]; then
+        echo "     - Subvolume: $BTRFS_SUBVOL"
+    fi
+    if [[ -n "$BTRFS_COMPRESS" ]]; then
+        echo "     - Compression: $BTRFS_COMPRESS"  
+    fi
+    if [[ "$BTRFS_DEVICES" -gt 1 ]]; then
+        echo "     - Multi-device setup: $BTRFS_DEVICES devices"
+    fi
+    if [[ "$SNAPSHOTS_FOUND" == true ]]; then
+        echo "     - Snapshot boot entries generated"
+    fi
+    echo "   • For Btrfs maintenance: btrfs scrub, btrfs balance, etc."
+fi
 echo ""   
