@@ -1,16 +1,27 @@
 #!/bin/bash
 
 # =============================================================================
-# install-refind.sh — Install and configure rEFInd from Arch live ISO
-# Designed to run AFTER pacstrap and chroot setup
-# Assumes: root mounted at /mnt, ESP mounted at /mnt/boot (or /boot/efi)
+# install-refind.sh — Install and configure rEFInd from Arch chroot environment
+# Designed to run INSIDE arch-chroot after system configuration
+# Assumes: ESP mounted at /boot (or /boot/efi if mounted separately)
 # =============================================================================
 
 set -euo pipefail  # Exit on errors, undefined vars, pipe failures
 
-TARGET_MNT="/mnt"
-ESP_MNT="$TARGET_MNT/boot"           # Common: /mnt/boot
-# ESP_MNT="$TARGET_MNT/boot/efi"    # Use this if you mount ESP separately
+# Detect if running in chroot or live environment
+if [[ "$(stat -c %d:%i /)" == "$(stat -c %d:%i /proc/1/root/.)" ]]; then
+    # Running in live environment
+    TARGET_MNT="/mnt"
+    ESP_MNT="$TARGET_MNT/boot"
+    echo "Detected: Running from live environment"
+else
+    # Running in chroot
+    TARGET_MNT=""
+    ESP_MNT="/boot"
+    echo "Detected: Running from chroot environment"
+fi
+
+# ESP_MNT="/boot/efi"    # Uncomment if you mount ESP separately at /boot/efi
 
 REFIND_DIR="$ESP_MNT/EFI/refind"
 LOGFILE="/tmp/refind-install.log"
@@ -54,8 +65,16 @@ echo "ESP detected at $ESP_MNT (filesystem: $ESP_FSTYPE)"
 # -----------------------------------------------------------------------------
 # 3. Detect root partition and filesystem
 # -----------------------------------------------------------------------------
-ROOT_DEVICE=$(findmnt -n -o SOURCE "$TARGET_MNT") || {
-    echo "Failed to detect root device (mounted at $TARGET_MNT)"
+if [[ -n "$TARGET_MNT" ]]; then
+    # Live environment
+    ROOT_MOUNT_POINT="$TARGET_MNT"
+else
+    # Chroot environment
+    ROOT_MOUNT_POINT="/"
+fi
+
+ROOT_DEVICE=$(findmnt -n -o SOURCE "$ROOT_MOUNT_POINT") || {
+    echo "Failed to detect root device (mounted at $ROOT_MOUNT_POINT)"
     exit 1
 }
 
@@ -64,7 +83,7 @@ ROOT_UUID=$(blkid -s UUID -o value "$ROOT_DEVICE") || {
     exit 1
 }
 
-ROOT_FSTYPE=$(findmnt -n -o FSTYPE "$TARGET_MNT")
+ROOT_FSTYPE=$(findmnt -n -o FSTYPE "$ROOT_MOUNT_POINT")
 if [ -z "$ROOT_FSTYPE" ]; then
     echo "Failed to detect filesystem type for root"
     exit 1
@@ -79,7 +98,15 @@ echo "Filesystem:  $ROOT_FSTYPE"
 # -----------------------------------------------------------------------------
 KERNEL_ENTRIES=()
 
-for kernel_img in "$TARGET_MNT"/boot/vmlinuz-*; do
+if [[ -n "$TARGET_MNT" ]]; then
+    # Live environment - look in /mnt/boot
+    BOOT_DIR="$TARGET_MNT/boot"
+else
+    # Chroot environment - look in /boot
+    BOOT_DIR="/boot"
+fi
+
+for kernel_img in "$BOOT_DIR"/vmlinuz-*; do
     if [[ ! -f "$kernel_img" ]]; then
         continue
     fi
@@ -90,7 +117,7 @@ for kernel_img in "$TARGET_MNT"/boot/vmlinuz-*; do
     FALLBACK="initramfs-$KERNEL_NAME-fallback.img"
 
     # Confirm initramfs exists
-    if [[ ! -f "$TARGET_MNT/boot/$INITRAMFS" ]]; then
+    if [[ ! -f "$BOOT_DIR/$INITRAMFS" ]]; then
         echo "Warning: $INITRAMFS not found!"
         continue
     fi
@@ -99,8 +126,8 @@ for kernel_img in "$TARGET_MNT"/boot/vmlinuz-*; do
 done
 
 if [ ${#KERNEL_ENTRIES[@]} -eq 0 ]; then
-    echo "No Linux kernels found in $TARGET_MNT/boot"
-    echo "Did you forget to pacstrap a kernel (e.g. linux, linux-lts)?"
+    echo "No Linux kernels found in $BOOT_DIR"
+    echo "Did you forget to install a kernel (e.g. linux, linux-lts)?"
     exit 1
 fi
 
@@ -153,7 +180,7 @@ for entry in "${KERNEL_ENTRIES[@]}"; do
     echo "\"Boot $KERNEL_NAME\" \"root=UUID=$ROOT_UUID rw rootfstype=$ROOT_FSTYPE quiet add_efi_memmap initrd=/$INITRAMFS\"" >> "$REFIND_DIR/refind_linux.conf"
 
     # Fallback initramfs entry (if exists)
-    if [[ -f "$TARGET_MNT/boot/$FALLBACK" ]]; then
+    if [[ -f "$BOOT_DIR/$FALLBACK" ]]; then
         echo "\"Boot $KERNEL_NAME (fallback initramfs)\" \"root=UUID=$ROOT_UUID rw rootfstype=$ROOT_FSTYPE quiet add_efi_memmap initrd=/$FALLBACK\"" >> "$REFIND_DIR/refind_linux.conf"
     fi
 
@@ -193,11 +220,18 @@ fi
 
 # Register with efibootmgr if we have the device info
 if [[ -n "${ESP_DISK:-}" && -n "${ESP_PART:-}" ]]; then
-    efibootmgr --create --disk "$ESP_DISK" --part "$ESP_PART" --loader "/EFI/refind/$EFI_BINARY" --label "rEFInd Boot Manager" || {
-        echo "Warning: Failed to register rEFInd with efibootmgr"
-        echo "You may need to manually add it from your BIOS/UEFI settings"
-    }
-    echo "✅ rEFInd registered with EFI boot manager"
+    if efibootmgr --create --disk "$ESP_DISK" --part "$ESP_PART" --loader "/EFI/refind/$EFI_BINARY" --label "rEFInd Boot Manager" 2>/dev/null; then
+        echo "✅ rEFInd registered with EFI boot manager"
+    else
+        echo "⚠️  Warning: Failed to register rEFInd with efibootmgr"
+        if [[ -z "$TARGET_MNT" ]]; then
+            echo "   This can happen in chroot environment. rEFInd should still work."
+            echo "   If needed, you can register it manually after reboot with:"
+            echo "   efibootmgr --create --disk $ESP_DISK --part $ESP_PART --loader /EFI/refind/$EFI_BINARY --label 'rEFInd Boot Manager'"
+        else
+            echo "   You may need to manually add it from your BIOS/UEFI settings"
+        fi
+    fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -222,9 +256,21 @@ echo "✅ Boot entries created for ${#KERNEL_ENTRIES[@]} kernel(s)"
 echo "✅ You can now reboot (remove ISO) and enjoy rEFInd!"
 
 # -----------------------------------------------------------------------------
-# Final note
+# Final notes and usage instructions
 # -----------------------------------------------------------------------------
 echo ""
-echo "💡 Tip: If you use LUKS, ZFS, or special modules, adjust kernel parameters accordingly."
-echo "    Example: Add 'cryptdevice=UUID=...:cryptroot' or 'zfs=zroot/ROOT/default'"
+echo "� USAGE:"
+if [[ -n "$TARGET_MNT" ]]; then
+    echo "   • This script can run from live environment OR chroot"
+    echo "   • Currently running from: Live environment"
+else
+    echo "   • This script can run from live environment OR chroot"
+    echo "   • Currently running from: Chroot environment"
+    echo "   • Run this INSIDE arch-chroot after configuring your system"
+fi
+echo ""
+echo "💡 TIPS:"
+echo "   • If you use LUKS: Add 'cryptdevice=UUID=...:cryptroot' to kernel parameters"
+echo "   • If you use ZFS: Add 'zfs=zroot/ROOT/default' (or your pool/dataset)"
+echo "   • Edit $REFIND_DIR/refind_linux.conf to customize boot parameters"
 echo ""   
